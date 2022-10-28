@@ -1,0 +1,173 @@
+import Pkg
+Pkg.activate(mktempdir())
+Pkg.add(["AIBECS", "Unitful", "WorldOceanAtlasTools", "Distributions", "F1Method", "Optim", "Inpaintings","JLD2","GEOTRACES","MAT","CSV","DataFrames","TickTock","Logging","LinearAlgebra"])
+
+using AIBECS
+using Unitful
+using Unitful: m, d, s, yr, Myr, mol, mmol, μmol, nmol, nM, μM, g, kg, L # Some useful units
+using WorldOceanAtlasTools
+using F1Method
+using Optim
+using Inpaintings # to paint the boxes with missing data
+using JLD2
+using GEOTRACES
+using MAT
+using DataFrames
+using Logging
+using LinearAlgebra
+
+# # disable messages about OCIM citations, cite them anyways!!!
+Logging.disable_logging(Logging.Info)
+
+# # load the neural net Ni
+# file=matopen("nets200.mat");   nets200=read(file,"nets200"); close(file)
+
+# load the MLR Ni climatology
+file=matopen("Niclimatology.mat");   Ni=read(file,"Niclimatology"); close(file)
+Ni=Ni[:,1]
+
+# load the WOA PO4 and Si
+@load "WOA_P_SI.JLD2" PO₄_obs Si_obs
+
+numruns=1
+
+allJs=Array{Float64,3}(undef,200160,numruns,3)*0
+allJs_alt=Array{Float64,3}(undef,200160,numruns,3)*0
+allSols=Array{Float64,3}(undef,200160,numruns,3)*0
+allPres=Array{Float64,3}(undef,200160,numruns,3)*0
+
+for i in 1:numruns
+
+# choose a random OCIM circulation, a random surface ocean restoring timescale from 1-9 months, and a random deep ocean restoring timescale from 3-60 months, per th Cd modeling
+randnum = rand(1:10)
+circulations=DataFrame(circs=["CTL_He","CTL_noHe","KiHIGH_He","KiHIGH_noHe","KiLOW_He","KiLOW_noHe","KvHIGH_He","KvHIGH_KiLOW_He","KvHIGH_KiLOW_noHe","KvHIGH_noHe"])
+
+# choose a random depth for cutoff between surface and deep
+zsurf = rand((74,114))
+
+# choose random values of tau surf and tau deep
+# everything is in SI units of seconds, the upreferred from unitful is SI
+τ_surf=ustrip(upreferred(rand(3:9)/12*u"yr"))
+τ_deep=ustrip(u"s",rand(12:60)/12*u"yr")
+
+print("i=",i," randnum=",randnum)
+
+# Load OCIM2
+grd, T = OCIM2.load(version=circulations.circs[randnum])
+T_Ni(p)=T
+z=depthvec(grd)
+
+# run the ni model
+
+# restoring towards the Ni values
+function U_Ni(x,p)
+    return @. (x-Ni)/τ_surf * (x≥Ni) * (z≤zsurf)+(x-Ni)/τ_deep * (z>zsurf)
+end
+
+# Complete biogeochemical cycling of dissolved Ni
+function BGC_Ni(x,p)
+    return @. -$U_Ni(x,p)
+end
+
+# Generate the state function `F` and its Jacobian `∇ₓF`
+nb = sum(iswet(grd))
+# F = AIBECSFunction((T_Ni), (BGC_Ni), nb, Params_Ni)
+F = AIBECSFunction((T_Ni), (BGC_Ni), nb)
+# F = AIBECSFunction(fun)
+# generate the steady-state problem,
+x_init = 5 * ones(nb) # initial guess
+# prob = SteadyStateProblem(F, x_init, p)
+prob = SteadyStateProblem(F, x_init)
+# and solve it
+τstop = ustrip(s, 1e3Myr) # tolerance
+sol_Ni = solve(prob, CTKAlg(), τstop=τstop).u #this is in units nM (just like Ni)
+
+J_Ni=T*sol_Ni #in units of nM/sJ
+J_Ni_alt = BGC_Ni(sol_Ni,1)
+
+#######################################################
+# run the p model
+#######################################################
+# Transport operator
+T_P(p) = T
+
+# restoring towards the P values
+function U_P(x,p)
+    return @. (x-PO₄_obs)/τ_surf * (x≥PO₄_obs) * (z≤zsurf)+(x-PO₄_obs)/τ_deep * (z>zsurf)
+end
+
+# Complete biogeochemical cycling of dissolved Ni
+function BGC_P(x, p)
+    return @. -$U_P(x,p)
+end
+
+# Generate the state function `F` and its Jacobian `∇ₓF`
+nb = sum(iswet(grd))
+# F = AIBECSFunction((T_Ni), (BGC_Ni), nb, Params_Ni)
+F = AIBECSFunction((T_P), (BGC_P), nb)
+# F = AIBECSFunction(fun)
+# generate the steady-state problem,
+x_init = 5 * ones(nb) # initial guess
+# prob = SteadyStateProblem(F, x_init, p)
+prob = SteadyStateProblem(F, x_init)
+# and solve it
+τstop = ustrip(s, 1e3Myr) # tolerance
+sol_P = solve(prob, CTKAlg(), τstop=τstop).u
+
+J_P=T*sol_P
+#######################################################
+# run the Si model
+# Transport operator
+T_SI(p) = T
+
+# restoring towards the Si values
+function U_SI(x,p)
+    return @. (x-Si_obs)/τ_surf * (x≥Si_obs) * (z≤zsurf)+(x-Si_obs)/τ_deep * (z>zsurf)
+end
+
+# Complete biogeochemical cycling of dissolved Ni
+function BGC_SI(x, p)
+    return @. -$U_SI(x,p)
+end
+
+# Generate the state function `F` and its Jacobian `∇ₓF`
+nb = sum(iswet(grd))
+# F = AIBECSFunction((T_Ni), (BGC_Ni), nb, Params_Ni)
+F = AIBECSFunction((T_SI), (BGC_SI), nb)
+# F = AIBECSFunction(fun)
+# generate the steady-state problem,
+x_init = 5 * ones(nb) # initial guess
+# prob = SteadyStateProblem(F, x_init, p)
+prob = SteadyStateProblem(F, x_init)
+# and solve it
+τstop = ustrip(s, 1e3Myr) # tolerance
+sol_Si = solve(prob, CTKAlg(), τstop=τstop).u
+
+J_Si=T*sol_Si
+########################################
+# convert from units of nM/s to nM/year for Ni, uM/ year for others, and save
+########################################
+allJs[:,i,1]=J_Ni*60*60*24*365
+allJs[:,i,2]=J_P*60*60*24*365
+allJs[:,i,3]=J_Si*60*60*24*365
+
+allSols[:,i,1]=sol_Ni
+allSols[:,i,2]=sol_P
+allSols[:,i,3]=sol_Si
+
+########################################
+# calcualte the preformed concentrations
+########################################
+Ni_pre = (T + sparse(Diagonal(z .≤ zsurf) / τ_fast)) \ ((z .≤ zsurf) .* sol_Ni / τ_fast)
+P_pre = (T + sparse(Diagonal(z .≤ zsurf) / τ_fast)) \ ((z .≤ zsurf) .* sol_P / τ_fast)
+Si_pre = (T + sparse(Diagonal(z .≤ zsurf) / τ_fast)) \ ((z .≤ zsurf) .* sol_Si / τ_fast)
+
+allPres[:,i,1]=Ni_pre
+allPres[:,i,2]=P_pre
+allPres[:,i,3]=Si_pre
+
+end
+
+file = matopen("allJs.mat", "w"); write(file, "allJs", allJs); close(file)
+file = matopen("allSols.mat", "w"); write(file, "allSols", allSols); close(file)
+file = matopen("allPres.mat", "w"); write(file, "allPres", allPres); close(file)
